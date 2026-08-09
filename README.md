@@ -1,56 +1,64 @@
-# Criteria Escrow on GenLayer
+# Intelligent Criteria Escrow
 
-Intelligent escrow contract that releases funds based on AI + web evaluation of deliverables.
+An intelligent escrow contract on GenLayer that releases funds only when a public deliverable satisfies the client's acceptance criteria — evaluated by AI with true validator consensus.
 
-## Overview
+## Problem
 
-Client locks GEN and defines acceptance criteria.  
+Traditional escrow relies on human judgment or centralized oracles.  
+This is slow, expensive, and not trustless.
+
+## Solution
+
+Client locks GEN and defines clear acceptance criteria.  
 Worker submits a public URL.  
-Anyone can trigger `judge()`, which:
-- Fetches the page (`gl.nondet.web.render`)
-- Evaluates it with LLM
-- Reaches consensus via independent validator re-execution (`gl.vm.run_nondet_unsafe`)
+Anyone can call `judge()`:
 
-If criteria are satisfied → `APPROVED_PENDING` (with challenge window) → `release` to worker.  
-Otherwise → `REJECTED` → client can `reclaim`.
+1. The page is fetched on-chain (`gl.nondet.web.render`)
+2. An LLM evaluates whether the content meets the criteria
+3. Validators independently re-fetch and re-evaluate
+4. Consensus is reached only on the binary decision (`satisfies`)
+
+If approved → challenge window → funds released to worker.  
+If rejected → client can reclaim.
 
 ## Key Features
 
-- Fully on-chain intelligent judgment (no centralized oracle)
-- Independent leader + validator evaluation (true consensus, not leader-output-only)
-- Challenge/dispute window for client
-- Cooldown + max judgment attempts protection
-- Support for top-up, cancel, reclaim
+- Fully on-chain AI judgment (no external oracle)
+- True consensus via independent leader + validator execution (`gl.vm.run_nondet_unsafe`)
+- Client challenge/dispute window
+- Judgment cooldown + max attempts protection
+- Support for top-up, cancel, and reclaim
 
 ## Deployed Contract (Bradbury Testnet)
 
-- Address: `0xc0bd9f43697A004162AaEBBAd99834C34C410cDA`  
-  *(replace with your final deployed address if different)*
+**Address:** `0xc0bd9f43697A004162AaEBBAd99834C34C410cDA`
 
-## How it works
+## How It Works
 
-1. **create(worker, criteria)** – Client locks funds
-2. **submit(bounty_id, url)** – Worker provides deliverable
-3. **judge(bounty_id)** – AI evaluation + consensus
-4. **dispute** (optional) – Client can reject during challenge window
-5. **release** – After challenge window, funds go to worker
-6. **reclaim** – Client recovers funds on rejection/expiry
+| Step | Method | Who | Description |
+|------|--------|-----|-------------|
+| 1 | `create(worker, criteria)` | Client | Locks funds and sets criteria |
+| 2 | `submit(bounty_id, url)` | Worker | Submits public deliverable URL |
+| 3 | `judge(bounty_id)` | Anyone | AI evaluation + consensus |
+| 4 | `dispute(bounty_id)` | Client | Rejects during challenge window |
+| 5 | `release(bounty_id)` | Anyone | Sends funds to worker after window |
+| 6 | `reclaim(bounty_id)` | Client | Recovers funds on rejection/expiry |
 
-## Test Results
+## Tested Flows
 
-Successfully tested on Bradbury:
+Successfully tested on Bradbury testnet:
+
 - Deploy
-- create → OPEN
-- submit → SUBMITTED
-- judge → APPROVED_PENDING (confidence: high)
-- dispute → REJECTED
+- Create bounty → `OPEN`
+- Submit deliverable → `SUBMITTED`
+- Judge → `APPROVED_PENDING` (confidence: high)
+- Dispute → `REJECTED`
 
 ## Tech Stack
 
-- GenLayer (Python contracts)
+- GenLayer (Python smart contracts)
 - Equivalence Principle with `run_nondet_unsafe`
 - Web rendering + LLM evaluation
+- Deterministic storage and state machine
 
-## License
-
-MIT
+## Project Structure
