@@ -62,3 +62,10 @@ Successfully tested on Bradbury testnet:
 - Deterministic storage and state machine
 
 ## Project Structure
+contracts/
+  criteria_escrow.py    # Main contract (v1.4.0)
+
+## License
+
+MIT
+
