@@ -7,7 +7,7 @@ import json
 import re
 import typing
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 STATE_OPEN = "OPEN"
 STATE_SUBMITTED = "SUBMITTED"
@@ -19,21 +19,16 @@ STATE_EXPIRED = "EXPIRED"
 
 MIN_CRITERIA_CHARS = 30
 MAX_CRITERIA_CHARS = 1200
-MAX_URL_CHARS = 300
-# Reduced from 24000: smaller pages/prompts execute faster on both leader
-# and validator, which lowers the chance of hitting LEADER_TIMEOUT on
-# testnet. Raise this back up if your criteria genuinely need more context.
-MAX_PAGE_CHARS = 7000
+MAX_URL_CHARS = 2048
+
 DEFAULT_DEADLINE_DAYS = 7
 DEFAULT_CHALLENGE_DAYS = 2
 MAX_JUDGMENT_ATTEMPTS = 4
 JUDGMENT_COOLDOWN_SECONDS = 45 * 60
 MIN_FUNDING = u256(5_000_000_000_000_000)
 
-
 def _now() -> int:
     return int(datetime.now(timezone.utc).timestamp())
-
 
 def _clean_text(value: typing.Any, limit: int) -> str:
     if not isinstance(value, str):
@@ -43,46 +38,31 @@ def _clean_text(value: typing.Any, limit: int) -> str:
         return ""
     return t
 
-
-def _clean_https_url(value: typing.Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    u = value.strip()
-    if not u.startswith("https://") or len(u) > MAX_URL_CHARS or "|" in u:
-        return ""
-    host_part = u[8:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-    if not host_part or "@" in host_part or ":" in host_part:
-        return ""
-    host = host_part.rstrip(".").lower()
-    if (
-        not host
-        or host in ("localhost", "127.0.0.1", "0.0.0.0")
-        or host.endswith((".local", ".internal", ".localhost"))
-        or re.fullmatch(r"[0-9.]+", host)
-        or ".." in host
-        or not re.fullmatch(r"[a-z0-9.-]+", host)
-    ):
-        return ""
-    labels = host.split(".")
-    if len(labels) < 2 or any(not x or x.startswith("-") or x.endswith("-") for x in labels):
-        return ""
-    return "https://" + host + u[8 + len(host_part) :]
-
+def _is_immutable(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    u = url.strip()
+    if not u:
+        return False
+    if len(u) > MAX_URL_CHARS:
+        return False
+    if u.startswith("ipfs://") or u.startswith("ar://"):
+        return True
+    if u.startswith("https://raw.githubusercontent.com/"):
+        parts = u.split("/")
+        if len(parts) >= 6 and len(parts[5]) == 40:
+            return True
+    return False
 
 def _sanitize_page(raw: typing.Any) -> str:
     if not isinstance(raw, str):
         return ""
     t = re.sub(r"<\s*/?\s*UNTRUSTED(?:\s+[^>]*)?\s*>", "", raw, flags=re.IGNORECASE)
-    t = " ".join(t.strip().split())
-    if len(t) > MAX_PAGE_CHARS:
-        t = t[:MAX_PAGE_CHARS]
-    return t
-
+    return " ".join(t.strip().split())
 
 def _decision_hash(criteria: str, url: str, satisfies: bool, confidence: str) -> str:
     material = f"CRITERIA_ESCROW|{VERSION}|{criteria}|{url}|{satisfies}|{confidence}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
-
 
 def _parse_address(value: typing.Any) -> Address:
     if isinstance(value, Address):
@@ -97,6 +77,46 @@ def _parse_address(value: typing.Any) -> Address:
     except Exception:
         raise gl.vm.UserError("invalid address")
 
+# Extracted non-deterministic AI logic to resolve GenVM Linter reachability issue
+def _judge_nondet(criteria: str, url: str) -> dict:
+    try:
+        res = gl.nondet.web.get(url)
+        raw = res.body.decode("utf-8", errors="replace") if res.body else ""
+    except Exception:
+        return {"satisfies": False, "confidence": "low", "note": "fetch_failed"}
+        
+    page = _sanitize_page(raw)
+    if not page:
+        return {"satisfies": False, "confidence": "low", "note": "empty_page"}
+        
+    prompt = f"""You are an impartial evaluator for a milestone payment escrow.
+Judge ONLY whether the PAGE content satisfies the ACCEPTANCE CRITERIA.
+Go through the criteria point by point. A point only counts as satisfied if
+the page contains explicit, concrete evidence for it. Do not assume,
+infer, or give benefit of the doubt.
+ACCEPTANCE CRITERIA:
+{criteria}
+PAGE:
+<UNTRUSTED>
+{page}
+</UNTRUSTED>
+Respond with exactly one JSON object:
+{{"satisfies": true or false, "confidence": "high" or "medium" or "low", "note": "short reason"}}
+"""
+    try:
+        result = gl.nondet.exec_prompt(prompt, response_format="json")
+    except Exception:
+        return {"satisfies": False, "confidence": "low", "note": "llm_error"}
+        
+    if not isinstance(result, dict):
+        return {"satisfies": False, "confidence": "low", "note": "bad_format"}
+        
+    satisfies = bool(result.get("satisfies", False))
+    conf = str(result.get("confidence", "low")).strip().lower()
+    if conf not in ("high", "medium", "low"):
+        conf = "low"
+    note = _clean_text(result.get("note", ""), 120) or "none"
+    return {"satisfies": satisfies, "confidence": conf, "note": note}
 
 @gl.evm.contract_interface
 class _Payee:
@@ -105,7 +125,6 @@ class _Payee:
 
     class Write:
         pass
-
 
 @allow_storage
 @dataclass
@@ -123,7 +142,6 @@ class Bounty:
     approved_at: u64
     decision_hash: str
     last_confidence: str
-
 
 class CriteriaEscrow(gl.Contract):
     bounties: TreeMap[u256, Bounty]
@@ -210,10 +228,12 @@ class CriteriaEscrow(gl.Contract):
         now = _now()
         if now >= int(b.deadline_at):
             raise gl.vm.UserError("deadline passed")
-        clean = _clean_https_url(url)
-        if not clean:
-            raise gl.vm.UserError("invalid public https url")
-        b.deliverable_url = clean
+            
+        clean_url = url.strip()
+        if not _is_immutable(clean_url):
+            raise gl.vm.UserError("Security Requirement: Deliverable URL must be an immutable IPFS, Arweave, or fixed-commit GitHub raw link.")
+            
+        b.deliverable_url = clean_url
         b.state = STATE_SUBMITTED
 
     @gl.public.write
@@ -235,65 +255,20 @@ class CriteriaEscrow(gl.Contract):
         criteria = str(b.criteria)
         url = str(b.deliverable_url)
 
-        def _judge_once() -> dict:
-            """
-            Runs on BOTH the leader and every validator, independently:
-            each of them fetches the page themselves and calls their own
-            LLM. This is what makes the result trustworthy - nobody is
-            just trusting the leader's word.
-            """
-            try:
-                raw = gl.nondet.web.render(url, mode="text")
-            except Exception:
-                return {"satisfies": False, "confidence": "low", "note": "fetch_failed"}
-            page = _sanitize_page(raw)
-            if not page:
-                return {"satisfies": False, "confidence": "low", "note": "empty_page"}
-            prompt = f"""You are an impartial evaluator for a milestone payment escrow.
-Judge ONLY whether the PAGE content satisfies the ACCEPTANCE CRITERIA.
-Go through the criteria point by point. A point only counts as satisfied if
-the page contains explicit, concrete evidence for it. Do not assume,
-infer, or give benefit of the doubt.
-ACCEPTANCE CRITERIA:
-{criteria}
-PAGE:
-<UNTRUSTED>
-{page}
-</UNTRUSTED>
-Respond with exactly one JSON object:
-{{"satisfies": true or false, "confidence": "high" or "medium" or "low", "note": "short reason"}}
-"""
-            try:
-                result = gl.nondet.exec_prompt(prompt, response_format="json")
-            except Exception:
-                return {"satisfies": False, "confidence": "low", "note": "llm_error"}
-            if not isinstance(result, dict):
-                return {"satisfies": False, "confidence": "low", "note": "bad_format"}
-            satisfies = bool(result.get("satisfies", False))
-            conf = str(result.get("confidence", "low")).strip().lower()
-            if conf not in ("high", "medium", "low"):
-                conf = "low"
-            note = _clean_text(result.get("note", ""), 120) or "none"
-            return {"satisfies": satisfies, "confidence": conf, "note": note}
-
         def leader_fn() -> dict:
-            return _judge_once()
+            return _judge_nondet(criteria, url)
 
         def validator_fn(leader_result) -> bool:
-            # Reject outright if the leader errored / didn't return.
             if not isinstance(leader_result, gl.vm.Return):
                 return False
             try:
-                validator_data = _judge_once()
+                validator_data = _judge_nondet(criteria, url)
             except Exception:
                 return False
             leader_data = leader_result.calldata
             if not isinstance(leader_data, dict):
                 return False
-            # Only the binary decision has to match between the leader's
-            # independent run and this validator's independent run.
-            # confidence/note are free text from two different LLM calls
-            # and will legitimately differ - they must never gate consensus.
+            # Consensus strictly on the binary logic decision
             return bool(leader_data.get("satisfies")) == bool(validator_data.get("satisfies"))
 
         outcome = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
