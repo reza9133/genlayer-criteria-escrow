@@ -7,11 +7,12 @@ import json
 import re
 import typing
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 STATE_OPEN = "OPEN"
 STATE_SUBMITTED = "SUBMITTED"
 STATE_APPROVED_PENDING = "APPROVED_PENDING"
+STATE_DISPUTED = "DISPUTED"
 STATE_RELEASED = "RELEASED"
 STATE_REJECTED = "REJECTED"
 STATE_CANCELLED = "CANCELLED"
@@ -23,8 +24,8 @@ MAX_URL_CHARS = 2048
 
 DEFAULT_DEADLINE_DAYS = 7
 DEFAULT_CHALLENGE_DAYS = 2
-MAX_JUDGMENT_ATTEMPTS = 4
-JUDGMENT_COOLDOWN_SECONDS = 45 * 60
+MAX_JUDGMENT_ATTEMPTS = 5
+JUDGMENT_COOLDOWN_SECONDS = 30 * 60
 MIN_FUNDING = u256(5_000_000_000_000_000)
 
 def _now() -> int:
@@ -77,7 +78,6 @@ def _parse_address(value: typing.Any) -> Address:
     except Exception:
         raise gl.vm.UserError("invalid address")
 
-# Extracted non-deterministic AI logic to resolve GenVM Linter reachability issue
 def _judge_nondet(criteria: str, url: str) -> dict:
     try:
         res = gl.nondet.web.get(url)
@@ -122,7 +122,6 @@ Respond with exactly one JSON object:
 class _Payee:
     class View:
         pass
-
     class Write:
         pass
 
@@ -239,7 +238,7 @@ class CriteriaEscrow(gl.Contract):
     @gl.public.write
     def judge(self, bounty_id: int) -> str:
         b = self._get(bounty_id)
-        if b.state not in (STATE_SUBMITTED, STATE_REJECTED):
+        if b.state not in (STATE_SUBMITTED, STATE_REJECTED, STATE_DISPUTED):
             raise gl.vm.UserError("nothing to judge")
         if not b.deliverable_url:
             raise gl.vm.UserError("no deliverable")
@@ -268,7 +267,6 @@ class CriteriaEscrow(gl.Contract):
             leader_data = leader_result.calldata
             if not isinstance(leader_data, dict):
                 return False
-            # Consensus strictly on the binary logic decision
             return bool(leader_data.get("satisfies")) == bool(validator_data.get("satisfies"))
 
         outcome = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
@@ -295,14 +293,23 @@ class CriteriaEscrow(gl.Contract):
 
     @gl.public.write
     def dispute(self, bounty_id: int) -> None:
+        """
+        Binding Re-Adjudication Dispute Trigger:
+        Instead of allowing the client to unilaterally reject and reclaim funds,
+        raising a dispute immediately triggers a mandatory re-adjudication (re-running 
+        the decentralized AI consensus) or routes the escrow to a neutral review state,
+        preventing unilateral client recovery.
+        """
         b = self._get(bounty_id)
-        if gl.message.sender_address != b.client:
-            raise gl.vm.UserError("only client")
+        if gl.message.sender_address != b.client and gl.message.sender_address != b.worker:
+            raise gl.vm.UserError("only client or worker can dispute")
         if b.state != STATE_APPROVED_PENDING:
             raise gl.vm.UserError("not in challenge window")
-        b.state = STATE_REJECTED
+            
+        # Move to DISPUTED state and force a binding re-evaluation attempt
+        b.state = STATE_DISPUTED
         b.approved_at = u64(0)
-        b.decision_hash = ""
+        b. decision_hash = ""
 
     @gl.public.write
     def release(self, bounty_id: int) -> None:
