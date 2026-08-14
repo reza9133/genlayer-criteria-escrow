@@ -25,7 +25,7 @@ MAX_URL_CHARS = 2048
 DEFAULT_DEADLINE_DAYS = 7
 DEFAULT_CHALLENGE_DAYS = 2
 MAX_JUDGMENT_ATTEMPTS = 5
-JUDGMENT_COOLDOWN_SECONDS = 30 * 60
+JUDGMENT_COOLDOWN_SECONDS = 0
 MIN_FUNDING = u256(5_000_000_000_000_000)
 
 def _now() -> int:
@@ -309,7 +309,7 @@ class CriteriaEscrow(gl.Contract):
         # Move to DISPUTED state and force a binding re-evaluation attempt
         b.state = STATE_DISPUTED
         b.approved_at = u64(0)
-        b. decision_hash = ""
+        b.decision_hash = ""
 
     @gl.public.write
     def release(self, bounty_id: int) -> None:
