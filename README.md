@@ -31,7 +31,7 @@ If rejected → client can reclaim.
 
 ## Deployed Contract (Bradbury Testnet)
 
-**Address:** `0x19077976De2BeaA895130f01200ba605d611e7D0`
+**Address:** `0xB7Bdc8266c351fc64010d3bf9dfd9cD6e43acbc2`
 
 ## How It Works
 
