@@ -1,4 +1,11 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+"""CriteriaEscrow — Decentralized Milestone Payment Escrow with Deterministic Dispute Exits
+
+=====================================================================
+Ensures that dispute lifecycles can never lock funds indefinitely.
+Provides deterministic fallback exits on deadlines and max judgment attempts.
+"""
+
 from genlayer import *
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -7,7 +14,7 @@ import json
 import re
 import typing
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 STATE_OPEN = "OPEN"
 STATE_SUBMITTED = "SUBMITTED"
@@ -84,11 +91,11 @@ def _judge_nondet(criteria: str, url: str) -> dict:
         raw = res.body.decode("utf-8", errors="replace") if res.body else ""
     except Exception:
         return {"satisfies": False, "confidence": "low", "note": "fetch_failed"}
-        
+
     page = _sanitize_page(raw)
     if not page:
         return {"satisfies": False, "confidence": "low", "note": "empty_page"}
-        
+
     prompt = f"""You are an impartial evaluator for a milestone payment escrow.
 Judge ONLY whether the PAGE content satisfies the ACCEPTANCE CRITERIA.
 Go through the criteria point by point. A point only counts as satisfied if
@@ -107,10 +114,10 @@ Respond with exactly one JSON object:
         result = gl.nondet.exec_prompt(prompt, response_format="json")
     except Exception:
         return {"satisfies": False, "confidence": "low", "note": "llm_error"}
-        
+
     if not isinstance(result, dict):
         return {"satisfies": False, "confidence": "low", "note": "bad_format"}
-        
+
     satisfies = bool(result.get("satisfies", False))
     conf = str(result.get("confidence", "low")).strip().lower()
     if conf not in ("high", "medium", "low"):
@@ -227,11 +234,11 @@ class CriteriaEscrow(gl.Contract):
         now = _now()
         if now >= int(b.deadline_at):
             raise gl.vm.UserError("deadline passed")
-            
+
         clean_url = url.strip()
         if not _is_immutable(clean_url):
             raise gl.vm.UserError("Security Requirement: Deliverable URL must be an immutable IPFS, Arweave, or fixed-commit GitHub raw link.")
-            
+
         b.deliverable_url = clean_url
         b.state = STATE_SUBMITTED
 
@@ -242,12 +249,19 @@ class CriteriaEscrow(gl.Contract):
             raise gl.vm.UserError("nothing to judge")
         if not b.deliverable_url:
             raise gl.vm.UserError("no deliverable")
+            
         now = _now()
+        
+        # Deterministic exit if deadline passed
         if now >= int(b.deadline_at):
-            raise gl.vm.UserError("deadline passed")
+            b.state = STATE_EXPIRED
+            return "EXPIRED"
+
+        # Deterministic exit if max judgment attempts reached
         if int(b.judgment_attempts) >= MAX_JUDGMENT_ATTEMPTS:
             b.state = STATE_EXPIRED
-            raise gl.vm.UserError("max judgment attempts reached")
+            return "EXPIRED"
+
         if int(b.last_judgment_at) > 0 and now < int(b.last_judgment_at) + JUDGMENT_COOLDOWN_SECONDS:
             raise gl.vm.UserError("cooldown active")
 
@@ -289,24 +303,20 @@ class CriteriaEscrow(gl.Contract):
         b.last_confidence = confidence
         if int(b.judgment_attempts) >= MAX_JUDGMENT_ATTEMPTS:
             b.state = STATE_EXPIRED
+            return "EXPIRED"
         return "REJECTED"
 
     @gl.public.write
     def dispute(self, bounty_id: int) -> None:
-        """
-        Binding Re-Adjudication Dispute Trigger:
-        Instead of allowing the client to unilaterally reject and reclaim funds,
-        raising a dispute immediately triggers a mandatory re-adjudication (re-running 
-        the decentralized AI consensus) or routes the escrow to a neutral review state,
-        preventing unilateral client recovery.
-        """
         b = self._get(bounty_id)
         if gl.message.sender_address != b.client and gl.message.sender_address != b.worker:
             raise gl.vm.UserError("only client or worker can dispute")
         if b.state != STATE_APPROVED_PENDING:
             raise gl.vm.UserError("not in challenge window")
-            
-        # Move to DISPUTED state and force a binding re-evaluation attempt
+        now = _now()
+        if now >= int(b.deadline_at):
+            raise gl.vm.UserError("deadline passed, cannot dispute")
+
         b.state = STATE_DISPUTED
         b.approved_at = u64(0)
         b.decision_hash = ""
@@ -334,8 +344,12 @@ class CriteriaEscrow(gl.Contract):
         if b.state in (STATE_RELEASED, STATE_CANCELLED):
             raise gl.vm.UserError("already closed")
         now = _now()
-        can_reclaim = b.state in (STATE_REJECTED, STATE_EXPIRED) or (
-            b.state in (STATE_OPEN, STATE_SUBMITTED) and now >= int(b.deadline_at)
+        
+        # Deterministic exit: STATE_DISPUTED is now reclaimable if deadline passed or max attempts reached
+        can_reclaim = (
+            b.state in (STATE_REJECTED, STATE_EXPIRED)
+            or (b.state == STATE_DISPUTED and (now >= int(b.deadline_at) or int(b.judgment_attempts) >= MAX_JUDGMENT_ATTEMPTS))
+            or (b.state in (STATE_OPEN, STATE_SUBMITTED) and now >= int(b.deadline_at))
         )
         if not can_reclaim:
             raise gl.vm.UserError("cannot reclaim yet")
