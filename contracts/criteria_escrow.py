@@ -3,7 +3,7 @@
 
 =====================================================================
 Ensures that dispute lifecycles can never lock funds indefinitely.
-Provides deterministic fallback exits on deadlines and max judgment attempts.
+Provides deterministic fallback exits on deadlines and binding final re-adjudication.
 """
 
 from genlayer import *
@@ -14,7 +14,7 @@ import json
 import re
 import typing
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 STATE_OPEN = "OPEN"
 STATE_SUBMITTED = "SUBMITTED"
@@ -245,7 +245,8 @@ class CriteriaEscrow(gl.Contract):
     @gl.public.write
     def judge(self, bounty_id: int) -> str:
         b = self._get(bounty_id)
-        if b.state not in (STATE_SUBMITTED, STATE_REJECTED, STATE_DISPUTED):
+        # Removed STATE_DISPUTED from here. Disputed states must use resolve_dispute.
+        if b.state not in (STATE_SUBMITTED, STATE_REJECTED):
             raise gl.vm.UserError("nothing to judge")
         if not b.deliverable_url:
             raise gl.vm.UserError("no deliverable")
@@ -321,15 +322,72 @@ class CriteriaEscrow(gl.Contract):
         b.approved_at = u64(0)
         b.decision_hash = ""
 
+    # NEW FUNCTION: Binding Final Re-adjudication for disputed states
+    @gl.public.write
+    def resolve_dispute(self, bounty_id: int) -> None:
+        b = self._get(bounty_id)
+        if b.state != STATE_DISPUTED:
+            raise gl.vm.UserError("bounty is not in dispute")
+        
+        now = _now()
+        if now >= int(b.deadline_at):
+            raise gl.vm.UserError("deadline passed, use release to claim timeout outcome")
+
+        criteria = str(b.criteria)
+        url = str(b.deliverable_url)
+
+        def leader_fn() -> dict:
+            return _judge_nondet(criteria, url)
+
+        def validator_fn(leader_result) -> bool:
+            if not isinstance(leader_result, gl.vm.Return):
+                return False
+            try:
+                validator_data = _judge_nondet(criteria, url)
+            except Exception:
+                return False
+            leader_data = leader_result.calldata
+            if not isinstance(leader_data, dict):
+                return False
+            return bool(leader_data.get("satisfies")) == bool(validator_data.get("satisfies"))
+
+        outcome = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        satisfies = bool(outcome.get("satisfies", False)) if isinstance(outcome, dict) else False
+        confidence = str(outcome.get("confidence", "low")) if isinstance(outcome, dict) else "low"
+
+        b.decision_hash = _decision_hash(criteria, url, satisfies, confidence)
+        b.last_confidence = confidence
+
+        amount = b.locked
+        b.locked = u256(0)
+
+        # Binding final payout based on AI consensus
+        if satisfies:
+            b.state = STATE_RELEASED
+            if amount > u256(0):
+                _Payee(b.worker).emit_transfer(value=amount)
+        else:
+            b.state = STATE_CANCELLED
+            if amount > u256(0):
+                _Payee(b.client).emit_transfer(value=amount)
+
     @gl.public.write
     def release(self, bounty_id: int) -> None:
         b = self._get(bounty_id)
-        if b.state != STATE_APPROVED_PENDING:
-            raise gl.vm.UserError("not ready for release")
         now = _now()
-        unlock = int(b.approved_at) + int(b.challenge_days) * 86400
-        if now < unlock:
-            raise gl.vm.UserError("challenge window still open")
+        
+        if b.state == STATE_APPROVED_PENDING:
+            unlock = int(b.approved_at) + int(b.challenge_days) * 86400
+            if now < unlock:
+                raise gl.vm.UserError("challenge window still open")
+        elif b.state == STATE_DISPUTED:
+            # Timeout Outcome: If disputed and deadline passed without resolution,
+            # default to the original AI approval (worker gets funds).
+            if now < int(b.deadline_at):
+                raise gl.vm.UserError("dispute must be resolved via resolve_dispute or wait for deadline")
+        else:
+            raise gl.vm.UserError("not ready for release")
+
         amount = b.locked
         b.locked = u256(0)
         b.state = STATE_RELEASED
@@ -345,14 +403,15 @@ class CriteriaEscrow(gl.Contract):
             raise gl.vm.UserError("already closed")
         now = _now()
         
-        # Deterministic exit: STATE_DISPUTED is now reclaimable if deadline passed or max attempts reached
+        # Deterministic exit: Removed STATE_DISPUTED to prevent unilateral client refund loophole
         can_reclaim = (
             b.state in (STATE_REJECTED, STATE_EXPIRED)
-            or (b.state == STATE_DISPUTED and (now >= int(b.deadline_at) or int(b.judgment_attempts) >= MAX_JUDGMENT_ATTEMPTS))
             or (b.state in (STATE_OPEN, STATE_SUBMITTED) and now >= int(b.deadline_at))
         )
+        
         if not can_reclaim:
             raise gl.vm.UserError("cannot reclaim yet")
+            
         amount = b.locked
         b.locked = u256(0)
         b.state = STATE_CANCELLED
